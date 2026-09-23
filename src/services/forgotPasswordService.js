@@ -50,7 +50,7 @@ function setRateLimit(email) {
 
 /**
  * Verify if user exists in the system
- * First checks users table, then falls back to the database auth.users
+ * First checks users table, then falls back to the central auth.users
  * @param {string} email - User email
  * @returns {object|null} User data or null if not found
  */

@@ -11,7 +11,7 @@
  *   client.auth / client.auth.admin → auth.users
  *   client.storage                 → public.storage_objects
  *
- * The connection role is expected to have BYPASSRLS, matching what the the database
+ * The connection role is expected to have BYPASSRLS, matching what the elevated role
  * service key did, so the former anon/service-key distinction has no
  * behavioural effect and both factories return the same client.
  */

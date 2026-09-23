@@ -1,7 +1,7 @@
 /**
  * Tenant database client.
  *
- * This tenant runs on a plain CloudNativePG Postgres with no the database in front
+ * This tenant runs on a plain CloudNativePG Postgres with no hosted backend in front
  * of it, so this returns the pg-backed query-builder client from
  * `./pgrest` instead of a db-js client. The surface is unchanged, so the
  * ~266 existing `.from(...)` call sites and all 22 `auth.*` calls keep working.

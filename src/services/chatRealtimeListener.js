@@ -4,7 +4,7 @@
  * Watches for new rows in `public.chat_messages` and
  * `public.order_entity_messages`, then fans out FCM via chatService.
  *
- * This tenant's database has no the database Realtime, so this listens on the
+ * This tenant's database has no hosted realtime, so this listens on the
  * PostgreSQL `chat_message_insert` / `order_entity_message_insert` channels
  * instead. The triggers that publish them are created by
  * `src/migrations/005_chat_notify_triggers.sql`.
