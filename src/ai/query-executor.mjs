@@ -1,4 +1,4 @@
-import { supabaseServer } from "./_supabase.mjs";
+import { dbServer } from "./_db.mjs";
 import { BLOCKED_TABLES } from "./sql-safety.mjs";
 import { getAiRequestContext } from "./audit-log.mjs";
 
@@ -61,7 +61,7 @@ export class UnknownColumnError extends Error {
 /**
  * Stage 3: Pre-flight column validation. Calls the _ai_validate_columns RPC
  * (added in migration 20260501000002) before any aggregate / select_rows /
- * count query. If the RPC isn't yet deployed (PGRST202 "function not found"),
+ * count query. If the RPC isn't yet deployed (FN_NOT_FOUND "function not found"),
  * skips validation gracefully so the codebase works against pre-migration
  * environments too.
  */
@@ -69,14 +69,14 @@ async function validateColumns(table, columns) {
   const cleaned = columns.filter((c) => typeof c === "string" && c.trim().length > 0);
   if (cleaned.length === 0) return;
 
-  const { error } = await supabaseServer.rpc("_ai_validate_columns", {
+  const { error } = await dbServer.rpc("_ai_validate_columns", {
     p_table: table,
     p_columns: cleaned,
   });
   if (!error) return;
 
   // Migration not yet applied — RPC missing. Skip validation silently.
-  if (error.code === "PGRST202" || /function .* does not exist/i.test(error.message)) {
+  if (error.code === "FN_NOT_FOUND" || /function .* does not exist/i.test(error.message)) {
     return;
   }
 
@@ -131,14 +131,14 @@ export async function executeTableQuery(
     ...collectFilterColumns(params.filters),
   ]);
 
-  // PostgREST/supabase-js has no native column-vs-column filter syntax. When
+  // pg query layer/db-js has no native column-vs-column filter syntax. When
   // any filter uses a column-compare operator, route through the
   // ai_select_rows RPC which builds the SQL server-side with %I/%I.
   if (hasColumnCompareFilter(params.filters)) {
     return executeRowsViaRpc(params);
   }
 
-  let query = supabaseServer.from(params.table).select(params.select || "*");
+  let query = dbServer.from(params.table).select(params.select || "*");
 
   if (params.filters) {
     for (const f of params.filters) {
@@ -221,14 +221,14 @@ function filtersToJsonb(filters) {
 
 /**
  * Routes executeTableQuery through the ai_select_rows RPC when filters
- * include column-compare operators (eq_col, gt_col, etc.). PostgREST has
+ * include column-compare operators (eq_col, gt_col, etc.). pg query layer has
  * no native syntax for column-vs-column predicates, so we let Postgres
  * build the WHERE clause via the RPC's safe identifier-only path.
  */
 async function executeRowsViaRpc(
   params,
 ) {
-  const { data, error } = await supabaseServer.rpc("ai_select_rows", {
+  const { data, error } = await dbServer.rpc("ai_select_rows", {
     p_table: params.table,
     p_filters: filtersToJsonb(params.filters),
     p_select: params.select ?? "*",
@@ -263,7 +263,7 @@ export async function executeAggregate(
     ...collectFilterColumns(params.filters),
   ]);
 
-  const { data, error } = await supabaseServer.rpc("ai_aggregate", {
+  const { data, error } = await dbServer.rpc("ai_aggregate", {
     p_table: params.table,
     p_filters: filtersToJsonb(params.filters),
     p_group_by: params.groupBy ?? null,
@@ -295,7 +295,7 @@ export async function executeCount(params) {
   // Stage 3: pre-validate filter column references.
   await validateColumns(params.table, collectFilterColumns(params.filters));
 
-  const { data, error } = await supabaseServer.rpc("ai_count", {
+  const { data, error } = await dbServer.rpc("ai_count", {
     p_table: params.table,
     p_filters: filtersToJsonb(params.filters),
   });

@@ -1,57 +1,62 @@
-const { createClient } = require('@supabase/supabase-js');
+/**
+ * Tenant database client.
+ *
+ * This tenant runs on a plain CloudNativePG Postgres with no the database in front
+ * of it, so this returns the pg-backed query-builder client from
+ * `./pgrest` instead of a db-js client. The surface is unchanged, so the
+ * ~266 existing `.from(...)` call sites and all 22 `auth.*` calls keep working.
+ *
+ * `getDb()` used the anon key and `getDbAdmin()` the service key.
+ * The database role this pool connects as is expected to have BYPASSRLS, which
+ * is what the service key effectively provided, so both now return the same
+ * client. That is a widening of `getDb()`'s former privileges — it is
+ * intentional, and matches how these calls were already used server-side.
+ */
 
-// Supabase configuration
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
+const { getPool } = require('../services/database/postgresClient');
+const { createPgRestClient } = require('./pgrest');
 
-let supabase = null; // Regular client (uses anon key, respects RLS)
-let supabaseAdmin = null; // Admin client (uses service key, bypasses RLS)
+let client = null;
 
-// Initialize regular Supabase client (with anon key)
-if (supabaseUrl && supabaseAnonKey && 
-    supabaseUrl !== 'your_supabase_project_url' && 
-    supabaseAnonKey !== 'your_supabase_anon_key') {
-  supabase = createClient(supabaseUrl, supabaseAnonKey);
-} else {
-  console.warn('⚠️  Supabase credentials not configured. Please update your .env file with your Supabase URL and API key.');
-}
+/**
+ * Build the client lazily, so it picks up the pool after dotenv has run.
+ *
+ * @returns {object} query-builder client
+ */
+function getClient() {
+  const pool = getPool();
 
-// Initialize admin Supabase client (with service key for admin operations)
-if (supabaseUrl && supabaseServiceKey && 
-    supabaseUrl !== 'your_supabase_project_url' && 
-    supabaseServiceKey !== 'your_supabase_service_key') {
-  supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false
-    }
-  });
-} else if (supabaseUrl && supabaseAnonKey) {
-  // Fallback to anon key if service key not available (for development)
-  console.warn('⚠️  SUPABASE_SERVICE_KEY not configured. Using anon key for admin operations (may fail with RLS).');
-  supabaseAdmin = supabase;
-}
-
-// Export a function that ensures Supabase is initialized
-function getSupabase() {
-  if (!supabase) {
-    throw new Error('Supabase is not configured. Please set SUPABASE_URL and SUPABASE_ANON_KEY in your .env file.');
+  if (!pool) {
+    throw new Error(
+      'Tenant database is not configured. Please set DATABASE_URL in your .env file.'
+    );
   }
-  return supabase;
+
+  if (!client) {
+    client = createPgRestClient(pool);
+  }
+  return client;
 }
 
-// Export admin client for operations that need to bypass RLS
-function getSupabaseAdmin() {
-  if (!supabaseAdmin) {
-    throw new Error('Supabase admin client is not configured. Please set SUPABASE_SERVICE_KEY in your .env file for admin operations.');
-  }
-  return supabaseAdmin;
+/**
+ * Tenant database client.
+ *
+ * @returns {object} query-builder client
+ */
+function getDb() {
+  return getClient();
+}
+
+/**
+ * Tenant database client with full privileges.
+ *
+ * @returns {object} query-builder client
+ */
+function getDbAdmin() {
+  return getClient();
 }
 
 module.exports = {
-  getSupabase,
-  getSupabaseAdmin
+  getDb,
+  getDbAdmin
 };
-
-

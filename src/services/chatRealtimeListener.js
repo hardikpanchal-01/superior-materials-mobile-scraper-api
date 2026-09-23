@@ -1,68 +1,49 @@
 /**
  * Chat realtime listener
  *
- * Subscribes to `public.chat_messages` INSERT events on every distinct tenant
- * Supabase project, then fans out FCM via chatService.notifyChatMessage.
+ * Watches for new rows in `public.chat_messages` and
+ * `public.order_entity_messages`, then fans out FCM via chatService.
  *
- * Tenants are configured by env in TENANT_SUPABASES (JSON array). The shared
- * SUPABASE_URL/SUPABASE_SERVICE_KEY pair is auto-included as a fallback so
- * single-project deployments work with no extra config.
+ * This tenant's database has no the database Realtime, so this listens on the
+ * PostgreSQL `chat_message_insert` / `order_entity_message_insert` channels
+ * instead. The triggers that publish them are created by
+ * `src/migrations/005_chat_notify_triggers.sql`.
  *
- * Example TENANT_SUPABASES value:
- *   [
- *     {"label":"shared","url":"https://lwplbyltqsfmfvsgmrjq.supabase.co","service_key":"...","subdomains":["dolese","hercules","preferredmaterials","sws"]},
- *     {"label":"concretesupply","url":"https://dqyhmnqrudybmkewwbku.supabase.co","service_key":"...","subdomains":["concretesupply"]},
- *     {"label":"delta","url":"https://etsemwbkyzwfhfktkndy.supabase.co","service_key":"...","subdomains":["delta"]},
- *     {"label":"sunrise","url":"https://ibziwfnjfwizjazfxntv.supabase.co","service_key":"...","subdomains":["sunrise"]}
- *   ]
+ * Only the row id travels in the notification payload (pg_notify caps payloads
+ * at 8000 bytes and a chat row carries free text plus a jsonb attachments blob),
+ * so each notification is followed by a read of the row.
  *
- * The "subdomains" field is informational only — the listener does not need
- * to resolve a per-message subdomain since the mobile tenant-switch is opt-in.
+ * `LISTEN` is bound to a single backend connection, so this holds its own
+ * standalone client rather than borrowing from the pool, and reconnects with
+ * backoff if that connection drops.
  */
 
-const { createClient } = require('@supabase/supabase-js');
+const { createStandaloneClient } = require('./database/postgresClient');
+const { getDbAdmin } = require('../config/database');
 const chatService = require('./chatService');
 
-const channels = [];
-const clients = [];
+const CHAT_CHANNEL = 'chat_message_insert';
+const ORDER_ENTITY_CHANNEL = 'order_entity_message_insert';
 
-function loadTenantConfigs() {
-  const configs = [];
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
 
-  if (process.env.TENANT_SUPABASES) {
-    try {
-      const parsed = JSON.parse(process.env.TENANT_SUPABASES);
-      if (Array.isArray(parsed)) {
-        for (const entry of parsed) {
-          if (entry && entry.url && entry.service_key) {
-            configs.push({
-              label: entry.label || entry.url,
-              url: entry.url,
-              service_key: entry.service_key,
-              subdomains: Array.isArray(entry.subdomains) ? entry.subdomains : [],
-            });
-          }
-        }
-      }
-    } catch (err) {
-      console.error('[ChatRealtime] TENANT_SUPABASES parse error:', err.message);
-    }
-  }
+let client = null;
+let stopping = false;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
 
-  // Auto-include the primary SUPABASE_URL if not already present
-  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
-    const exists = configs.find((c) => c.url === process.env.SUPABASE_URL);
-    if (!exists) {
-      configs.push({
-        label: 'primary',
-        url: process.env.SUPABASE_URL,
-        service_key: process.env.SUPABASE_SERVICE_KEY,
-        subdomains: [],
-      });
-    }
-  }
-
-  return configs;
+/**
+ * Describe this deployment for log lines and the tenant_subdomain field.
+ *
+ * @returns {object} {label, subdomains}
+ */
+function listenerConfig() {
+  const subdomain = process.env.TENANT_SUBDOMAIN || '';
+  return {
+    label: subdomain || 'tenant',
+    subdomains: subdomain ? [subdomain] : []
+  };
 }
 
 function buildPreview(text, attachments) {
@@ -75,8 +56,8 @@ function buildPreview(text, attachments) {
   return '';
 }
 
-async function fetchActiveRecipients(supabase, senderId) {
-  const { data, error } = await supabase
+async function fetchActiveRecipients(db, senderId) {
+  const { data, error } = await db
     .from('users')
     .select('id')
     .eq('active', true);
@@ -94,8 +75,8 @@ async function fetchActiveRecipients(supabase, senderId) {
     .filter((id) => id && id !== senderId);
 }
 
-async function fetchOrderMeta(supabase, orderId) {
-  const { data, error } = await supabase
+async function fetchOrderMeta(db, orderId) {
+  const { data, error } = await db
     .from('orders')
     .select('order_id, order_code, order_date, customer_name')
     .eq('order_id', orderId)
@@ -111,20 +92,59 @@ async function fetchOrderMeta(supabase, orderId) {
   return data || null;
 }
 
-async function handleInsert(config, payload) {
-  const row = payload?.new;
+/**
+ * Read the chat_messages row a notification referred to.
+ *
+ * @param {object} db - Tenant database client
+ * @param {string} id - Row id
+ * @returns {Promise<object|null>} Row
+ */
+async function fetchChatMessage(db, id) {
+  const { data, error } = await db
+    .from('chat_messages')
+    .select('id, chat_id, order_id, sender_id, sender_name, message_text, attachments, is_deleted')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[ChatRealtime] failed to load chat_message:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+/**
+ * Read the order_entity_messages row a notification referred to.
+ *
+ * @param {object} db - Tenant database client
+ * @param {string} id - Row id
+ * @returns {Promise<object|null>} Row
+ */
+async function fetchOrderEntityMessage(db, id) {
+  const { data, error } = await db
+    .from('order_entity_messages')
+    .select('id, order_entity_id, sender_id, sender_name, message_text')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[ChatRealtime] failed to load order_entity_message:', error.message);
+    return null;
+  }
+  return data || null;
+}
+
+async function handleInsert(config, row) {
   if (!row) return;
   if (row.is_deleted === true) return;
   if (!row.sender_id || !row.order_id) return;
 
   try {
-    const supabase = createClient(config.url, config.service_key, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const db = getDbAdmin();
 
     const [recipients, orderMeta] = await Promise.all([
-      fetchActiveRecipients(supabase, row.sender_id),
-      fetchOrderMeta(supabase, row.order_id),
+      fetchActiveRecipients(db, row.sender_id),
+      fetchOrderMeta(db, row.order_id),
     ]);
 
     if (recipients.length === 0) {
@@ -163,8 +183,8 @@ async function handleInsert(config, payload) {
   }
 }
 
-async function fetchOrderEntityMeta(supabase, orderEntityId) {
-  const { data, error } = await supabase
+async function fetchOrderEntityMeta(db, orderEntityId) {
+  const { data, error } = await db
     .from('order_entities')
     .select('id, job_name, company_name, on_job_date')
     .eq('id', orderEntityId)
@@ -180,19 +200,16 @@ async function fetchOrderEntityMeta(supabase, orderEntityId) {
   return data || null;
 }
 
-async function handleOrderEntityInsert(config, payload) {
-  const row = payload?.new;
+async function handleOrderEntityInsert(config, row) {
   if (!row) return;
   if (!row.sender_id || !row.order_entity_id) return;
 
   try {
-    const supabase = createClient(config.url, config.service_key, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
+    const db = getDbAdmin();
 
     const [recipients, meta] = await Promise.all([
-      fetchActiveRecipients(supabase, row.sender_id),
-      fetchOrderEntityMeta(supabase, row.order_entity_id),
+      fetchActiveRecipients(db, row.sender_id),
+      fetchOrderEntityMeta(db, row.order_entity_id),
     ]);
 
     if (recipients.length === 0) {
@@ -228,61 +245,104 @@ async function handleOrderEntityInsert(config, payload) {
   }
 }
 
-function subscribeOne(config) {
-  const client = createClient(config.url, config.service_key, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
-  clients.push(client);
+/**
+ * Route one NOTIFY payload to its handler.
+ *
+ * @param {object} config - Listener config
+ * @param {object} message - pg notification {channel, payload}
+ * @returns {Promise<void>}
+ */
+async function dispatch(config, message) {
+  const id = message.payload;
+  if (!id) return;
 
-  // Order chat (chat_messages → orders)
-  const chatChannel = client
-    .channel(`chat-messages-watcher-${config.label}`)
-    .on(
-      'postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'chat_messages' },
-      (payload) => handleInsert(config, payload),
-    )
-    .subscribe((status, err) => {
-      if (err) {
-        console.error(
-          `[ChatRealtime][${config.label}] chat_messages subscribe error:`,
-          err.message || err,
-        );
-      } else {
-        console.log(
-          `[ChatRealtime][${config.label}] chat_messages: ${status}`,
-        );
-      }
-    });
-  channels.push(chatChannel);
-
-  // Order Request chat (order_entity_messages → order_entities)
-  const reqChannel = client
-    .channel(`order-entity-messages-watcher-${config.label}`)
-    .on(
-      'postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'order_entity_messages' },
-      (payload) => handleOrderEntityInsert(config, payload),
-    )
-    .subscribe((status, err) => {
-      if (err) {
-        console.error(
-          `[ChatRealtime][${config.label}] order_entity_messages subscribe error:`,
-          err.message || err,
-        );
-      } else {
-        console.log(
-          `[ChatRealtime][${config.label}] order_entity_messages: ${status}`,
-        );
-      }
-    });
-  channels.push(reqChannel);
+  try {
+    const db = getDbAdmin();
+    if (message.channel === CHAT_CHANNEL) {
+      await handleInsert(config, await fetchChatMessage(db, id));
+    } else if (message.channel === ORDER_ENTITY_CHANNEL) {
+      await handleOrderEntityInsert(config, await fetchOrderEntityMessage(db, id));
+    }
+  } catch (err) {
+    console.error(`[ChatRealtime][${config.label}] dispatch error:`, err.message);
+  }
 }
 
+/**
+ * Open the listening connection and subscribe to both channels.
+ *
+ * @param {object} config - Listener config
+ * @returns {Promise<void>}
+ */
+async function connect(config) {
+  client = createStandaloneClient();
+  if (!client) {
+    console.warn('[ChatRealtime] DATABASE_URL is not set — listener disabled');
+    return;
+  }
+
+  client.on('notification', (message) => { dispatch(config, message); });
+
+  client.on('error', (err) => {
+    console.error(`[ChatRealtime][${config.label}] connection error:`, err.message);
+    scheduleReconnect(config);
+  });
+
+  client.on('end', () => {
+    if (!stopping) scheduleReconnect(config);
+  });
+
+  await client.connect();
+  await client.query(`LISTEN ${CHAT_CHANNEL}`);
+  await client.query(`LISTEN ${ORDER_ENTITY_CHANNEL}`);
+
+  reconnectAttempts = 0;
+  console.log(`[ChatRealtime][${config.label}] listening on ${CHAT_CHANNEL}, ${ORDER_ENTITY_CHANNEL}`);
+}
+
+/**
+ * Reconnect with exponential backoff.
+ *
+ * @param {object} config - Listener config
+ */
+function scheduleReconnect(config) {
+  if (stopping || reconnectTimer) return;
+
+  // Drop the dead client so a late 'end' event can't queue a second reconnect.
+  const dead = client;
+  client = null;
+  if (dead) {
+    try { dead.removeAllListeners(); dead.end().catch(() => {}); } catch (e) { /* already gone */ }
+  }
+
+  const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempts), RECONNECT_MAX_MS);
+  reconnectAttempts++;
+
+  console.log(`[ChatRealtime][${config.label}] reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    if (stopping) return;
+    try {
+      await connect(config);
+    } catch (err) {
+      console.error(`[ChatRealtime][${config.label}] reconnect failed:`, err.message);
+      scheduleReconnect(config);
+    }
+  }, delay);
+
+  if (reconnectTimer.unref) reconnectTimer.unref();
+}
+
+/**
+ * Start listening for new chat messages.
+ *
+ * @returns {void}
+ */
 function startChatRealtimeListener() {
   // Kill switch — set CHAT_REALTIME_DISABLED=true on whichever backend you
   // don't want firing FCM (e.g. disable on production while testing locally,
-  // or vice versa) to avoid double-pushes when prod + local share a Supabase.
+  // or vice versa) to avoid double-pushes when prod + local share a database.
   if (
     process.env.CHAT_REALTIME_DISABLED === 'true' ||
     process.env.CHAT_REALTIME_DISABLED === '1'
@@ -293,62 +353,38 @@ function startChatRealtimeListener() {
     return;
   }
 
-  let configs = loadTenantConfigs();
-  if (configs.length === 0) {
-    console.warn(
-      '[ChatRealtime] no Supabase configs found — listener disabled',
-    );
-    return;
-  }
+  stopping = false;
+  const config = listenerConfig();
 
-  // Per-project disable — comma-separated list of labels (e.g. "primary,sunrise")
-  // matching the `label` field in TENANT_SUPABASES (auto-included primary uses
-  // label "primary"). Use this when one tenant's prod backend already fires FCM
-  // (so local should skip it) but other tenants' prod is down (local must fire).
-  const disabledRaw = process.env.CHAT_REALTIME_DISABLED_PROJECTS;
-  if (disabledRaw) {
-    const disabledLabels = new Set(
-      disabledRaw
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-    );
-    const before = configs.length;
-    configs = configs.filter((c) => !disabledLabels.has(c.label));
-    const skipped = before - configs.length;
-    if (skipped > 0) {
-      console.log(
-        `[ChatRealtime] CHAT_REALTIME_DISABLED_PROJECTS skipped ${skipped} project(s): ${[...disabledLabels].join(', ')}`,
-      );
-    }
-  }
-
-  if (configs.length === 0) {
-    console.warn(
-      '[ChatRealtime] all configured projects are disabled — listener will not start',
-    );
-    return;
-  }
-
-  console.log(
-    `[ChatRealtime] starting listener for ${configs.length} tenant Supabase project(s)`,
-  );
-  for (const cfg of configs) {
-    subscribeOne(cfg);
-  }
+  connect(config).catch((err) => {
+    console.error(`[ChatRealtime][${config.label}] initial connect failed:`, err.message);
+    scheduleReconnect(config);
+  });
 }
 
+/**
+ * Stop listening and release the connection.
+ *
+ * @returns {Promise<void>}
+ */
 async function stopChatRealtimeListener() {
-  console.log('[ChatRealtime] stopping listener…');
-  await Promise.allSettled(
-    channels.map((ch) =>
-      ch.unsubscribe().catch((err) =>
-        console.error('[ChatRealtime] unsubscribe error:', err.message),
-      ),
-    ),
-  );
-  channels.length = 0;
-  clients.length = 0;
+  stopping = true;
+
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  if (client) {
+    const closing = client;
+    client = null;
+    closing.removeAllListeners();
+    try {
+      await closing.end();
+    } catch (err) {
+      console.error('[ChatRealtime] error closing listener connection:', err.message);
+    }
+  }
 }
 
 module.exports = {
