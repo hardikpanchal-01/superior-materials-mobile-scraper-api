@@ -91,19 +91,30 @@ if (DATABASE_URL) {
   console.warn('⚠️  DATABASE_URL not configured - PostgreSQL features will be unavailable');
 }
 
+// LISTEN/NOTIFY needs a direct connection. DATABASE_URL normally points at
+// PgBouncer in transaction mode, which hands the server connection back after
+// every statement: LISTEN succeeds there but notifications never arrive.
+const REALTIME_DATABASE_URL = process.env.REALTIME_DATABASE_URL;
+
 /**
- * Create a standalone (non-pooled) client using the same connection settings.
+ * Create a standalone (non-pooled) client for LISTEN.
  *
  * `LISTEN` registers on one specific backend connection, so it cannot use the
  * pool — a pooled client would stop receiving notifications as soon as it were
- * released and handed to someone else.
+ * released and handed to someone else. It uses REALTIME_DATABASE_URL (a direct,
+ * non-PgBouncer host) and only falls back to DATABASE_URL, with a warning.
  *
- * @returns {object|null} An unconnected pg Client, or null if DATABASE_URL is unset
+ * @returns {object|null} An unconnected pg Client, or null if no URL is set
  */
 function createStandaloneClient() {
-  if (!DATABASE_URL) return null;
-  const { connectionString, ssl } = resolveSslConfig(DATABASE_URL);
-  return new pg.Client({ connectionString, ssl });
+  const url = REALTIME_DATABASE_URL || DATABASE_URL;
+  if (!url) return null;
+  if (!REALTIME_DATABASE_URL) {
+    console.warn('⚠️  REALTIME_DATABASE_URL not set - LISTEN is using DATABASE_URL; notifications will never arrive if that is a PgBouncer pooler');
+  }
+  const { connectionString, ssl } = resolveSslConfig(url);
+  // keepAlive so a silently dropped connection is detected and reconnected.
+  return new pg.Client({ connectionString, ssl, keepAlive: true });
 }
 
 /**

@@ -14,6 +14,7 @@
 
 const { quoteIdent, quoteTable, buildCondition, buildOrCondition } = require('./filters');
 const { EMBEDDED_SELECTS } = require('./embedded');
+const { restQuery, jsonColumnsOf, toJsonParam } = require('./types');
 
 /**
  * Shape an error the way callers already expect from db-js.
@@ -27,6 +28,30 @@ function toDbError(err) {
     code: err.code || 'DB_ERROR',
     details: err.detail || err.details || null,
     hint: err.hint || null
+  };
+}
+
+/**
+ * Shape a `.single()` / `.maybeSingle()` result. As before the migration, more
+ * than one row is an error for both, and zero rows is an error only for
+ * `.single()`.
+ *
+ * @param {object[]} rows - Result rows
+ * @param {boolean} maybe - true for `.maybeSingle()`
+ * @returns {{data: any, error: object|null, count: null}}
+ */
+function singleResult(rows, maybe) {
+  if (rows.length === 1) return { data: rows[0], count: null, error: null };
+  if (rows.length === 0 && maybe) return { data: null, count: null, error: null };
+  return {
+    data: null,
+    count: null,
+    error: {
+      message: 'JSON object requested, multiple (or no) rows returned',
+      code: 'NO_ROWS',
+      details: `The result contains ${rows.length} rows`,
+      hint: null
+    }
   };
 }
 
@@ -230,9 +255,11 @@ class PgRestQuery {
   /**
    * Compile the whole statement.
    *
+   * @param {Set<string>} [jsonColumns] - json/jsonb columns of the target table;
+   *   their values are sent as JSON text (see ./types)
    * @returns {{text: string, values: any[]}}
    */
-  _toSql() {
+  _toSql(jsonColumns = new Set()) {
     const values = [];
     const addParam = (v) => {
       values.push(v);
@@ -240,6 +267,8 @@ class PgRestQuery {
     };
 
     const table = quoteTable(this._table);
+    const bind = (column, value) =>
+      addParam(jsonColumns.has(column) ? toJsonParam(value) : value);
     let text;
 
     if (this._mode === 'select') {
@@ -255,12 +284,17 @@ class PgRestQuery {
       const rows = this._values || [];
       if (rows.length === 0) throw new Error('insert/upsert called with no rows');
 
-      // Union the keys so rows with differing shapes still line up; missing
-      // keys become NULL rather than shifting columns.
-      const columns = [...new Set(rows.flatMap(r => Object.keys(r)))];
+      // Union the keys so rows with differing shapes still line up; a key
+      // missing from one row becomes NULL there. Keys that are `undefined` in
+      // every row are dropped, as JSON serialisation dropped them before, so
+      // the column default still applies.
+      const columns = [...new Set(rows.flatMap(r =>
+        Object.keys(r).filter(k => r[k] !== undefined)
+      ))];
+      if (columns.length === 0) throw new Error('insert/upsert called with no values');
       const colSql = columns.map(quoteIdent).join(', ');
       const tuples = rows.map(row =>
-        `(${columns.map(c => addParam(row[c] === undefined ? null : row[c])).join(', ')})`
+        `(${columns.map(c => bind(c, row[c] === undefined ? null : row[c])).join(', ')})`
       );
 
       text = `INSERT INTO ${table} (${colSql}) VALUES ${tuples.join(', ')}`;
@@ -280,9 +314,10 @@ class PgRestQuery {
           : ` ON CONFLICT (${conflictCols}) DO NOTHING`;
       }
     } else if (this._mode === 'update') {
-      const entries = Object.entries(this._values || {});
+      // `undefined` leaves the column untouched rather than nulling it.
+      const entries = Object.entries(this._values || {}).filter(([, v]) => v !== undefined);
       if (entries.length === 0) throw new Error('update called with no values');
-      const sets = entries.map(([c, v]) => `${quoteIdent(c)} = ${addParam(v)}`);
+      const sets = entries.map(([c, v]) => `${quoteIdent(c)} = ${bind(c, v)}`);
       text = `UPDATE ${table} SET ${sets.join(', ')}`;
       text += this._buildWhere(addParam);
     } else if (this._mode === 'delete') {
@@ -330,13 +365,16 @@ class PgRestQuery {
 
     let compiled;
     try {
-      compiled = this._toSql();
+      const jsonColumns = this._mode === 'select'
+        ? new Set()
+        : await jsonColumnsOf(this._pool, quoteTable(this._table));
+      compiled = this._toSql(jsonColumns);
     } catch (err) {
       return { data: null, count: null, error: toDbError(err) };
     }
 
     try {
-      const result = await this._pool.query(compiled.text, compiled.values);
+      const result = await restQuery(this._pool, compiled.text, compiled.values);
 
       if (this._head && this._count) {
         return { data: null, count: Number(result.rows[0]?.__count ?? 0), error: null };
@@ -345,20 +383,7 @@ class PgRestQuery {
       const rows = result.rows;
 
       if (this._single || this._maybeSingle) {
-        if (rows.length === 0) {
-          if (this._maybeSingle) return { data: null, count: null, error: null };
-          return {
-            data: null,
-            count: null,
-            error: {
-              message: 'JSON object requested, multiple (or no) rows returned',
-              code: 'NO_ROWS',
-              details: 'The result contains 0 rows',
-              hint: null
-            }
-          };
-        }
-        return { data: rows[0], count: null, error: null };
+        return singleResult(rows, this._maybeSingle);
       }
 
       // `.select('*', { count: 'exact' })` without head: rows plus a total.
@@ -388,7 +413,7 @@ class PgRestQuery {
     const values = [];
     const addParam = (v) => { values.push(v); return `$${values.length}`; };
     const text = `SELECT count(*)::bigint AS "__count" FROM ${quoteTable(this._table)}${this._buildWhere(addParam)}`;
-    const result = await this._pool.query(text, values);
+    const result = await restQuery(this._pool, text, values);
     return Number(result.rows[0]?.__count ?? 0);
   }
 
@@ -406,4 +431,4 @@ class PgRestQuery {
   }
 }
 
-module.exports = { PgRestQuery, toDbError };
+module.exports = { PgRestQuery, toDbError, singleResult };

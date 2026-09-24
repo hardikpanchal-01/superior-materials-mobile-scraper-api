@@ -149,23 +149,24 @@ function parseFilterSegment(segment) {
   if (firstDot === -1) throw new Error(`Malformed filter segment: ${segment}`);
 
   const column = trimmed.slice(0, firstDot);
-  const remainder = trimmed.slice(firstDot + 1);
+  let remainder = trimmed.slice(firstDot + 1);
+
+  // `col.not.op.value` — the negation sits between the column and the operator.
+  let negated = false;
+  if (remainder.startsWith('not.')) {
+    negated = true;
+    remainder = remainder.slice(4);
+  }
 
   const secondDot = remainder.indexOf('.');
   if (secondDot === -1) throw new Error(`Malformed filter segment: ${segment}`);
 
-  let op = remainder.slice(0, secondDot);
+  const op = remainder.slice(0, secondDot);
   let value = remainder.slice(secondDot + 1);
 
   // Strip pg query layer's optional double quotes around the value.
   if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
     value = value.slice(1, -1);
-  }
-
-  let negated = false;
-  if (op.startsWith('not.')) {
-    negated = true;
-    op = op.slice(4);
   }
 
   if (op === 'is') {
@@ -194,12 +195,37 @@ function parseFilterSegment(segment) {
  * @returns {string} Parenthesised OR condition
  */
 function buildOrCondition(input, addParam, alias) {
+  return buildLogicalCondition(input, 'OR', addParam, alias);
+}
+
+const GROUP_RE = /^(not\.)?(and|or)\(([\s\S]*)\)$/;
+
+/**
+ * Join the segments of a filter string with AND/OR. A segment may itself be a
+ * nested group — `and(a.eq.1,b.is.null)`, `or(...)`, or `not.and(...)` — as
+ * the REST filter grammar allows.
+ *
+ * @param {string} input - Comma-separated filter segments
+ * @param {'AND'|'OR'} joiner - How to combine the segments
+ * @param {function(any): string} addParam - Parameter registrar
+ * @param {string} [alias] - Optional table alias to qualify columns with
+ * @returns {string} Parenthesised condition
+ */
+function buildLogicalCondition(input, joiner, addParam, alias) {
   const conditions = splitTopLevel(input)
-    .filter(s => s.trim())
-    .map(segment => buildCondition(parseFilterSegment(segment), addParam, alias));
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(segment => {
+      const group = segment.match(GROUP_RE);
+      if (group) {
+        const inner = buildLogicalCondition(group[3], group[2].toUpperCase(), addParam, alias);
+        return group[1] ? `NOT ${inner}` : inner;
+      }
+      return buildCondition(parseFilterSegment(segment), addParam, alias);
+    });
 
   if (conditions.length === 0) return 'TRUE';
-  return `(${conditions.join(' OR ')})`;
+  return `(${conditions.join(` ${joiner} `)})`;
 }
 
 module.exports = {

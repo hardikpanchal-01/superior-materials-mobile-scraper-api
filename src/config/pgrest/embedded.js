@@ -12,6 +12,7 @@
  */
 
 const { buildCondition, buildOrCondition } = require('./filters');
+const { restQuery } = require('./types');
 
 /**
  * Render the WHERE clause for an embedded query, qualifying every column with
@@ -42,24 +43,13 @@ function whereForAlias(query, addParam, alias) {
  */
 async function run(query, text, values) {
   try {
-    const result = await query._pool.query(text, values);
+    const result = await restQuery(query._pool, text, values);
     const rows = result.rows;
 
     if (query._single || query._maybeSingle) {
-      if (rows.length === 0) {
-        if (query._maybeSingle) return { data: null, count: null, error: null };
-        return {
-          data: null,
-          count: null,
-          error: {
-            message: 'JSON object requested, multiple (or no) rows returned',
-            code: 'NO_ROWS',
-            details: 'The result contains 0 rows',
-            hint: null
-          }
-        };
-      }
-      return { data: rows[0], count: null, error: null };
+      // Required lazily: queryBuilder requires this module at load time.
+      const { singleResult } = require('./queryBuilder');
+      return singleResult(rows, query._maybeSingle);
     }
     return { data: rows, count: null, error: null };
   } catch (err) {

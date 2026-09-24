@@ -12,6 +12,7 @@
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { restQuery } = require('./types');
 
 const USER_COLUMNS = `
   id, email, phone, aud, role,
@@ -70,7 +71,7 @@ function createAuth(pool) {
    */
   async function query(text, values = []) {
     if (!pool) throw new Error('PostgreSQL pool not configured. Please set DATABASE_URL.');
-    const result = await pool.query(text, values);
+    const result = await restQuery(pool, text, values);
     return result.rows;
   }
 
@@ -270,21 +271,37 @@ function createAuth(pool) {
     admin,
 
     /**
-     * Verify an email/password pair against `encrypted_password`.
+     * Verify an email/password or phone/password pair against
+     * `encrypted_password`.
      *
-     * @param {object} credentials - {email, password}
+     * Phone numbers are stored without the leading `+`, so the supplied number
+     * matches with or without it.
+     *
+     * @param {object} credentials - {email, password} or {phone, password}
      * @returns {Promise<object>} `{ data: { user, session }, error }`
      */
-    async signInWithPassword({ email, password } = {}) {
+    async signInWithPassword({ email, phone, password } = {}) {
       try {
-        const normalized = String(email || '').toLowerCase().trim();
-        const rows = await query(
-          `SELECT ${USER_COLUMNS}, encrypted_password
-             FROM auth.users
-            WHERE lower(email) = $1 AND deleted_at IS NULL
-            LIMIT 1`,
-          [normalized]
-        );
+        let rows;
+        if (!email && phone) {
+          const trimmed = String(phone).trim();
+          rows = trimmed ? await query(
+            `SELECT ${USER_COLUMNS}, encrypted_password
+               FROM auth.users
+              WHERE phone IN ($1, $2) AND deleted_at IS NULL
+              LIMIT 1`,
+            [trimmed, trimmed.replace(/^\+/, '')]
+          ) : [];
+        } else {
+          const normalized = String(email || '').toLowerCase().trim();
+          rows = await query(
+            `SELECT ${USER_COLUMNS}, encrypted_password
+               FROM auth.users
+              WHERE lower(email) = $1 AND deleted_at IS NULL
+              LIMIT 1`,
+            [normalized]
+          );
+        }
 
         const row = rows[0];
         // Same message whether the account is missing or the password is wrong,

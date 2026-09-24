@@ -108,11 +108,13 @@ async function getDailyTruckTimes(date) {
          FROM order_product_schedules s
          JOIN order_products op ON op.id = s.order_product_id
          JOIN orders o ON o.order_id = op.order_id
-        WHERE s.start_time >= $1::timestamptz
-          AND s.start_time <  $1::timestamptz + interval '1 day'
+        WHERE s.start_time >= ($1::date::timestamp AT TIME ZONE $2)
+          AND s.start_time <  (($1::date + 1)::timestamp AT TIME ZONE $2)
           AND o.removed IS DISTINCT FROM true
         ORDER BY s.start_time ASC`,
-      [`${date} 00:00:00`]
+      // The day is the business-timezone day, not the database's UTC day, so
+      // evening pours stay on the date they were scheduled for.
+      [date, BUSINESS_TIMEZONE]
     );
 
     // Handle no schedules case
@@ -166,9 +168,13 @@ async function getDailyTruckTimes(date) {
             AND active = true
             AND remove_reason_code IS NULL
             AND on_job_time IS NOT NULL
+            -- Order codes can repeat across days; only this day's loads (plus
+            -- 12h for pours that run past midnight) count as actual times.
+            AND on_job_time >= ($2::date::timestamp AT TIME ZONE $3)
+            AND on_job_time <  (($2::date + 1)::timestamp AT TIME ZONE $3) + interval '12 hours'
           ORDER BY on_job_time ASC
           LIMIT 1`,
-        [firstOrderCode]
+        [firstOrderCode, date, BUSINESS_TIMEZONE]
       );
       actualFirstTruckTime = rows[0]?.on_job_time ?? null;
     }
@@ -183,9 +189,13 @@ async function getDailyTruckTimes(date) {
             AND active = true
             AND remove_reason_code IS NULL
             AND on_job_time IS NOT NULL
+            -- Order codes can repeat across days; only this day's loads (plus
+            -- 12h for pours that run past midnight) count as actual times.
+            AND on_job_time >= ($2::date::timestamp AT TIME ZONE $3)
+            AND on_job_time <  (($2::date + 1)::timestamp AT TIME ZONE $3) + interval '12 hours'
           ORDER BY on_job_time DESC
           LIMIT 1`,
-        [lastOrderCode]
+        [lastOrderCode, date, BUSINESS_TIMEZONE]
       );
       actualLastTruckTime = rows[0]?.on_job_time ?? null;
     }
