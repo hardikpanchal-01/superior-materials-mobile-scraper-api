@@ -2,12 +2,12 @@
  * Truck Time Service
  *
  * Validates email sending windows based on truck schedules.
- * Integrates with the Supabase Edge Function to get first/last truck times.
+ * Computes first/last truck times for a day directly from the tenant database.
  */
 
+const { getPool } = require('./database/postgresClient');
+
 // Configuration
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY;
 const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || 'America/Chicago';
 const EMAIL_TIME_WINDOW_ENABLED = process.env.EMAIL_TIME_WINDOW_ENABLED !== 'false';
 const EMAIL_TIME_WINDOW_BUFFER_MINUTES = parseInt(process.env.EMAIL_TIME_WINDOW_BUFFER_MINUTES) || 0;
@@ -50,18 +50,43 @@ function formatTimeInTimezone(date = new Date()) {
 }
 
 /**
- * Fetch daily truck times from Supabase Edge Function
+ * Normalise a timestamp value to an ISO-8601 string (or null).
+ *
+ * `timestamptz` columns come back from `pg` as `Date` instances; callers of this
+ * service expect ISO strings, so everything is coerced here.
+ *
+ * @param {Date|string|null} value - Timestamp value
+ * @returns {string|null} ISO string, or null
+ */
+function toIso(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Compute the first and last truck times for a given day, directly from the
+ * tenant database.
+ *
+ * The first truck is the earliest-starting schedule of the day; the last truck
+ * is derived from the latest-starting schedule (tie-broken by the one with the
+ * most loads, which extends furthest into the day) as
+ * `start_time + (number_of_loads - 1) * truck_space` minutes. Where a matching
+ * ticket has an actual `on_job_time`, that actual value is preferred over the
+ * estimate.
+ *
  * @param {string} date - Date in YYYY-MM-DD format
  * @returns {Promise<Object>} Truck times response
  */
 async function getDailyTruckTimes(date) {
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    console.error('Supabase configuration missing for truck times API');
+  const pool = getPool();
+  if (!pool) {
+    console.error('Database not configured for truck times lookup');
     return {
       date,
       first_truck_time: null,
       last_truck_time: null,
-      error: 'Supabase configuration missing'
+      error: 'Database not configured'
     };
   }
 
@@ -72,29 +97,135 @@ async function getDailyTruckTimes(date) {
   }
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-    const response = await fetch(
-      `${SUPABASE_URL}/functions/v1/get-daily-truck-times?date=${date}`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-          'apikey': SUPABASE_ANON_KEY,
-          'Content-Type': 'application/json',
-        },
-        signal: controller.signal
-      }
+    // Step 1: all active schedules for the day, earliest first.
+    const { rows: schedules } = await pool.query(
+      `SELECT s.id,
+              s.start_time,
+              s.number_of_loads,
+              s.truck_space,
+              s.plant_code,
+              o.order_code
+         FROM order_product_schedules s
+         JOIN order_products op ON op.id = s.order_product_id
+         JOIN orders o ON o.order_id = op.order_id
+        WHERE s.start_time >= ($1::date::timestamp AT TIME ZONE $2)
+          AND s.start_time <  (($1::date + 1)::timestamp AT TIME ZONE $2)
+          AND o.removed IS DISTINCT FROM true
+        ORDER BY s.start_time ASC`,
+      // The day is the business-timezone day, not the database's UTC day, so
+      // evening pours stay on the date they were scheduled for.
+      [date, BUSINESS_TIMEZONE]
     );
 
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(`Edge function returned ${response.status}: ${response.statusText}`);
+    // Handle no schedules case
+    if (schedules.length === 0) {
+      const emptyResult = {
+        date,
+        first_truck_time: null,
+        first_truck_source: 'estimated',
+        first_truck_order_code: null,
+        last_truck_time: null,
+        last_truck_source: 'estimated',
+        last_truck_order_code: null,
+        last_truck_calculation: null,
+        total_schedules: 0,
+        total_trucks_scheduled: 0
+      };
+      _truckTimesCache.set(date, { data: emptyResult, timestamp: Date.now() });
+      return emptyResult;
     }
 
-    const data = await response.json();
+    // Step 2: first schedule (first truck base)
+    const firstSchedule = schedules[0];
+    const firstOrderCode = firstSchedule.order_code || null;
+    const estimatedFirstTruckTime = firstSchedule.start_time;
+
+    // Step 3: last schedule with tie-breaker (most loads wins)
+    const latestStartMs = new Date(schedules[schedules.length - 1].start_time).getTime();
+    const schedulesWithLatestStart = schedules.filter(
+      (s) => new Date(s.start_time).getTime() === latestStartMs
+    );
+    const lastSchedule = schedulesWithLatestStart.reduce((max, s) =>
+      s.number_of_loads > max.number_of_loads ? s : max
+    );
+    const lastOrderCode = lastSchedule.order_code || null;
+
+    // Step 4: estimated last truck time
+    // Formula: start_time + (number_of_loads - 1) * truck_space
+    const baseTime = new Date(lastSchedule.start_time);
+    const loads = lastSchedule.number_of_loads || 1;
+    const spacing = lastSchedule.truck_space ?? 0;
+    const offsetMs = (loads - 1) * spacing * 60 * 1000; // minutes → ms
+    const estimatedLastTruckTime = new Date(baseTime.getTime() + offsetMs);
+
+    // Step 5: hybrid — actual ticket time for the first order
+    let actualFirstTruckTime = null;
+    if (firstOrderCode) {
+      const { rows } = await pool.query(
+        `SELECT on_job_time
+           FROM tickets
+          WHERE order_code = $1
+            AND active = true
+            AND remove_reason_code IS NULL
+            AND on_job_time IS NOT NULL
+            -- Order codes can repeat across days; only this day's loads (plus
+            -- 12h for pours that run past midnight) count as actual times.
+            AND on_job_time >= ($2::date::timestamp AT TIME ZONE $3)
+            AND on_job_time <  (($2::date + 1)::timestamp AT TIME ZONE $3) + interval '12 hours'
+          ORDER BY on_job_time ASC
+          LIMIT 1`,
+        [firstOrderCode, date, BUSINESS_TIMEZONE]
+      );
+      actualFirstTruckTime = rows[0]?.on_job_time ?? null;
+    }
+
+    // Step 6: hybrid — actual ticket time for the last order (last load)
+    let actualLastTruckTime = null;
+    if (lastOrderCode) {
+      const { rows } = await pool.query(
+        `SELECT on_job_time
+           FROM tickets
+          WHERE order_code = $1
+            AND active = true
+            AND remove_reason_code IS NULL
+            AND on_job_time IS NOT NULL
+            -- Order codes can repeat across days; only this day's loads (plus
+            -- 12h for pours that run past midnight) count as actual times.
+            AND on_job_time >= ($2::date::timestamp AT TIME ZONE $3)
+            AND on_job_time <  (($2::date + 1)::timestamp AT TIME ZONE $3) + interval '12 hours'
+          ORDER BY on_job_time DESC
+          LIMIT 1`,
+        [lastOrderCode, date, BUSINESS_TIMEZONE]
+      );
+      actualLastTruckTime = rows[0]?.on_job_time ?? null;
+    }
+
+    // Step 7: build result — prefer actual times over estimated
+    const firstTruckTime = toIso(actualFirstTruckTime) ?? toIso(estimatedFirstTruckTime);
+    const firstTruckSource = actualFirstTruckTime ? 'actual' : 'estimated';
+    const lastTruckTime = toIso(actualLastTruckTime) ?? estimatedLastTruckTime.toISOString();
+    const lastTruckSource = actualLastTruckTime ? 'actual' : 'estimated';
+
+    // Step 8: statistics
+    const totalSchedules = schedules.length;
+    const totalTrucks = schedules.reduce((sum, s) => sum + (s.number_of_loads || 0), 0);
+
+    const data = {
+      date,
+      first_truck_time: firstTruckTime,
+      first_truck_source: firstTruckSource,
+      first_truck_order_code: firstOrderCode,
+      last_truck_time: lastTruckTime,
+      last_truck_source: lastTruckSource,
+      last_truck_order_code: lastOrderCode,
+      last_truck_calculation: {
+        base_start_time: toIso(lastSchedule.start_time),
+        number_of_loads: loads,
+        truck_space_minutes: spacing
+      },
+      total_schedules: totalSchedules,
+      total_trucks_scheduled: totalTrucks
+    };
 
     console.log(`Truck times for ${date}:`, {
       first: data.first_truck_time,
@@ -102,23 +233,11 @@ async function getDailyTruckTimes(date) {
       source: `${data.first_truck_source}/${data.last_truck_source}`
     });
 
-    // Cache the result
     _truckTimesCache.set(date, { data, timestamp: Date.now() });
 
     return data;
   } catch (error) {
-    // Handle abort error specifically
-    if (error.name === 'AbortError') {
-      console.error(`Truck times API timeout for date ${date}`);
-      return {
-        date,
-        first_truck_time: null,
-        last_truck_time: null,
-        error: 'Request timeout'
-      };
-    }
-
-    console.error(`Failed to fetch truck times for ${date}:`, error.message);
+    console.error(`Failed to compute truck times for ${date}:`, error.message);
 
     // Fail closed - don't send emails if we can't verify the window
     return {
@@ -285,13 +404,13 @@ async function validateEmailSendingWindow({ orderDate, currentTime }) {
   // Step 2: Fetch truck times for today
   const truckTimes = await getDailyTruckTimes(todayDate);
 
-  // Step 3: Handle edge function error
+  // Step 3: Handle truck-times lookup error
   if (truckTimes.error) {
     return {
       shouldSendEmail: false,
       reason: `Failed to fetch truck times: ${truckTimes.error}`,
       details: {
-        check: 'edge_function_error',
+        check: 'truck_times_error',
         error: truckTimes.error,
         todayDate
       }
