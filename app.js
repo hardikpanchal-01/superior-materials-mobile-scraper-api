@@ -176,6 +176,36 @@ app.get('/api/pdfs/:filename', (req, res) => {
 });
 
 // =============================================================================
+// Object storage
+// =============================================================================
+
+// Serve stored objects (avatars, scraped-order JSON). These used to be public
+// object storage URLs; the bytes now live in `public.storage_objects` and are
+// served here so existing avatar_url values keep resolving.
+app.get('/storage/:bucket/*objectPath', async (req, res) => {
+  try {
+    const { getStorage } = require('./src/services/database/storageClient');
+    // Express 5 gives a named wildcard as an array of path segments.
+    const segments = req.params.objectPath;
+    const objectPath = (Array.isArray(segments) ? segments : [segments])
+      .map(decodeURIComponent)
+      .join('/');
+    const { data, error } = await getStorage().from(req.params.bucket).download(objectPath);
+
+    if (error || !data) {
+      return res.status(404).json({ success: false, message: 'Object not found' });
+    }
+
+    res.set('Content-Type', data.contentType || 'application/octet-stream');
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    return res.send(data.buffer);
+  } catch (err) {
+    console.error('Storage fetch error:', err.message);
+    return res.status(500).json({ success: false, message: 'Failed to fetch object' });
+  }
+});
+
+// =============================================================================
 // Routes
 // =============================================================================
 
