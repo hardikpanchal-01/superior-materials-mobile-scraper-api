@@ -99,6 +99,7 @@ async function getUserByEmail(email) {
     .limit(1);
 
   if (error) {
+    console.error('[MobileAuth] getUserByEmail failed:', error.code || '', error.message);
     return null;
   }
 
@@ -127,6 +128,7 @@ async function getUserById(userId) {
     .limit(1);
 
   if (error) {
+    console.error('[MobileAuth] getUserById failed:', error.code || '', error.message);
     return null;
   }
 
@@ -156,6 +158,7 @@ async function getTenantUser(userId, tenantId = null) {
   const { data, error } = await query.limit(1);
 
   if (error) {
+    console.error('[MobileAuth] getTenantUser failed:', error.code || '', error.message);
     return null;
   }
 
