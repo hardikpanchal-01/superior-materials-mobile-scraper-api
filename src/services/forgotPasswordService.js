@@ -11,6 +11,7 @@
 const { getDbAdmin } = require('../config/database');
 const { executeDirectSQL } = require('../utils/postgresExecutor');
 const nodemailer = require('nodemailer');
+const { resolveResetBase } = require('../utils/resetLinkBase');
 
 // Rate limiting configuration
 const RATE_LIMIT_WINDOW = 5 * 60 * 1000; // 5 minutes in milliseconds
@@ -438,7 +439,13 @@ async function requestPasswordReset(email, redirectTo = null) {
 
   // Step 4: Generate reset token
   console.log('[ForgotPassword] Step 4: Generating reset token...');
-  const tokenResult = await generateResetToken(normalizedEmail, redirectTo);
+  // The reset link host comes from config; redirect_url is used only if its
+  // origin is one of this tenant's configured frontend origins (see utils/resetLinkBase).
+  const { baseUrl, source: baseUrlSource, rejected: redirectRejected } = resolveResetBase(redirectTo);
+  if (redirectRejected) {
+    console.warn('[ForgotPassword] Step 4: redirect_url ignored (origin not allowed); using the configured reset URL');
+  }
+  const tokenResult = await generateResetToken(normalizedEmail, baseUrl);
   if (!tokenResult.success) {
     console.log('[ForgotPassword] Step 4 Failed: Token generation failed -', tokenResult.error);
     return {
@@ -450,8 +457,7 @@ async function requestPasswordReset(email, redirectTo = null) {
   console.log('[ForgotPassword] Step 4 Passed: Token generated');
 
   // Step 5: Build reset URL
-  const baseUrl = redirectTo || process.env.PASSWORD_RESET_REDIRECT_URL || (process.env.NEXT_PUBLIC_APP_URL ? `${process.env.NEXT_PUBLIC_APP_URL}/reset-password` : 'http://localhost:3000/reset-password');
-  console.log('[ForgotPassword] Step 5: Using baseUrl -', baseUrl);
+  console.log('[ForgotPassword] Step 5: Using baseUrl -', baseUrl, '(from ' + baseUrlSource + ')');
   console.log('[ForgotPassword] Step 5: Env vars - PASSWORD_RESET_REDIRECT_URL:', process.env.PASSWORD_RESET_REDIRECT_URL, 'NEXT_PUBLIC_APP_URL:', process.env.NEXT_PUBLIC_APP_URL);
   
   // Extract token from actionLink if it exists, otherwise use token from result
@@ -469,7 +475,7 @@ async function requestPasswordReset(email, redirectTo = null) {
   
   // Always build our own reset link with the correct production URL
   const resetLink = resetToken ? `${baseUrl}?token=${resetToken}&email=${encodeURIComponent(normalizedEmail)}` : tokenResult.actionLink;
-  console.log('[ForgotPassword] Step 5: Reset link built -', resetLink);
+  console.log('[ForgotPassword] Step 5: Reset link built (token not logged) -', baseUrl);
 
   // Step 6: Send reset email
   console.log('[ForgotPassword] Step 6: Sending reset email...');
