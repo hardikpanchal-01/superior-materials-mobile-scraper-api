@@ -102,7 +102,7 @@ function computeTruckRate(spacing) {
 }
 
 function getOrderUrl(orderId) {
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://sws.truckast.ai';
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://vcna-superior.truckast.ai';
   return `${baseUrl}/order-request/${orderId}`;
 }
 
